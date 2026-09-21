@@ -796,6 +796,38 @@ def sell_lot(state, lot):
 
     if lot["remaining_size"] <= POSITION_TOLERANCE:
         state["open_lots"].remove(lot)
+    elif not lot.get("residual"):
+        # Il residuo confluisce nel lotto residui della coin (prezzo medio ponderato)
+        state["open_lots"].remove(lot)
+
+        residual = next((l for l in state["open_lots"] if l.get("residual") and l["coin"] == coin), None)
+
+        if residual is None:
+            residual = {
+                "id": state["next_lot_id"],
+                "coin": coin,
+                "residual": True,
+                "buy_time": lot["buy_time"],
+                "buy_price": 0.0,
+                "buy_size": 0.0,
+                "remaining_size": 0.0,
+                "buy_fee": 0.0,
+                "target_price": 0.0
+            }
+
+            state["next_lot_id"] += 1
+
+            state["open_lots"].append(residual)
+
+        total_size = residual["remaining_size"] + lot["remaining_size"]
+
+        residual["buy_price"] = (residual["remaining_size"] * residual["buy_price"] + lot["remaining_size"] * lot["buy_price"]) / total_size
+        residual["buy_fee"] += lot["buy_fee"] * (lot["remaining_size"] / lot["buy_size"])
+        residual["buy_size"] += lot["remaining_size"]
+        residual["remaining_size"] = total_size
+
+        # Target: prezzo medio di acquisto dei residui + TAKE_PROFIT_PERCENT
+        residual["target_price"] = residual["buy_price"] * (1 + TAKE_PROFIT_PERCENT / 100)
 
     state["last_sell"] = trade
 
