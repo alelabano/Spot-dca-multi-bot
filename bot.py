@@ -28,7 +28,7 @@ COINS = [c.strip().upper() for c in os.getenv("COINS", "HYPE,ZEC,ETH,SOL").split
 # LOOP: verifica ogni 4 ore, niente piu' candele
 LOOP_INTERVAL_SECONDS = int(os.getenv("LOOP_INTERVAL_SECONDS", "14400"))
 
-BUY_USD = float(os.getenv("BUY_USD", "10"))
+BUY_USD = float(os.getenv("BUY_USD", "12"))
 MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "200"))
 MAX_WEEKLY_BUYS = int(os.getenv("MAX_WEEKLY_BUYS", "10"))
 
@@ -54,6 +54,9 @@ POSITION_TOLERANCE = float(os.getenv("POSITION_TOLERANCE", "0.00003"))
 
 # Valore minimo di un ordine spot su Hyperliquid
 MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "10"))
+
+# Percentuale del lotto venduta al raggiungimento del target
+SELL_PERCENT = float(os.getenv("SELL_PERCENT", "95"))
 
 
 # ============================================================
@@ -694,7 +697,7 @@ def get_sellable_lots(state, prices):
             continue
 
         # size vendibile (multiplo di szDecimals) sotto il minimo d'ordine
-        if round_size(coin, lot["remaining_size"]) * current_price < MIN_ORDER_USD:
+        if round_size(coin, lot["remaining_size"] * SELL_PERCENT / 100) * current_price < MIN_ORDER_USD:
             continue
 
         if current_price >= lot["target_price"]:
@@ -711,7 +714,7 @@ def get_sellable_lots(state, prices):
 def sell_lot(state, lot):
     coin = lot["coin"]
 
-    sell_size = round_size(coin, lot["remaining_size"])
+    sell_size = round_size(coin, lot["remaining_size"] * SELL_PERCENT / 100)
 
     if sell_size <= 0:
         return False
