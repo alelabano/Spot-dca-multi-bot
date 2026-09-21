@@ -22,6 +22,9 @@ load_dotenv()
 PRIVATE_KEY = os.getenv("HYPERLIQUID_PRIVATE_KEY")
 ACCOUNT_ADDRESS = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS")
 
+# COIN gestite (nome base, senza prefisso U)
+COINS = [c.strip().upper() for c in os.getenv("COINS", "HYPE,ZEC,ETH,SOL").split(",") if c.strip()]
+
 # LOOP: verifica ogni 4 ore, niente piu' candele
 LOOP_INTERVAL_SECONDS = int(os.getenv("LOOP_INTERVAL_SECONDS", "14400"))
 
@@ -49,6 +52,9 @@ FILL_CHECK_DELAY = float(os.getenv("FILL_CHECK_DELAY", "1"))
 
 POSITION_TOLERANCE = float(os.getenv("POSITION_TOLERANCE", "0.00003"))
 
+# Valore minimo di un ordine spot su Hyperliquid
+MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "10"))
+
 
 # ============================================================
 # VALIDAZIONE
@@ -73,47 +79,63 @@ exchange = Exchange(wallet, constants.MAINNET_API_URL, account_address=ACCOUNT_A
 
 
 # ============================================================
-# RISOLUZIONE COPPIA SPOT BTC
+# RISOLUZIONE COPPIE SPOT
 # ============================================================
-# Su HyperCore il pair BTC/USDC mostrato sull'interfaccia puo'
-# corrispondere a un nome diverso nei metadata (es. UBTC/USDC).
-# Risolviamo il nome corretto una sola volta all'avvio.
+# Su HyperCore il pair mostrato sull'interfaccia puo' corrispondere
+# a un nome diverso nei metadata (es. UBTC/USDC, UETH/USDC, USOL/USDC).
+# Risolviamo una sola volta all'avvio, per ogni coin: nome del mercato,
+# nome del token e szDecimals.
 
-def resolve_spot_coin():
+def resolve_spot_markets():
     meta = info.spot_meta()
 
-    base_token_idx = None
-    base_name = None
     quote_token_idx = None
 
     for idx, token in enumerate(meta["tokens"]):
-        name = token.get("name")
-
-        if name in ("UBTC", "BTC") and base_token_idx is None:
-            base_token_idx = idx
-            base_name = name
-
-        if name == "USDC" and quote_token_idx is None:
+        if token.get("name") == "USDC" and quote_token_idx is None:
             quote_token_idx = idx
-
-    if base_token_idx is None:
-        token_names = [t.get("name") for t in meta["tokens"]]
-        print(f"DEBUG TOKENS DISPONIBILI | {token_names}", flush=True)
-        raise RuntimeError("Nessun token BTC/UBTC trovato nei metadata Spot")
 
     if quote_token_idx is None:
         raise RuntimeError("Nessun token USDC trovato nei metadata Spot")
 
-    for market in meta["universe"]:
-        tokens = market.get("tokens", [])
+    markets = {}
 
-        if len(tokens) == 2 and tokens[0] == base_token_idx and tokens[1] == quote_token_idx:
-            return market["name"], base_name
+    for coin in COINS:
+        found = None
 
-    raise RuntimeError(f"Nessun mercato spot {base_name}/USDC trovato nei metadata Hyperliquid")
+        for idx, token in enumerate(meta["tokens"]):
+            if token.get("name") not in (coin, "U" + coin):
+                continue
+
+            for market in meta["universe"]:
+                tokens = market.get("tokens", [])
+
+                if len(tokens) == 2 and tokens[0] == idx and tokens[1] == quote_token_idx:
+                    found = {
+                        "market": market["name"],
+                        "base": token["name"],
+                        "decimals": int(token["szDecimals"])
+                    }
+                    break
+
+            if found:
+                break
+
+        if not found:
+            print(f"ATTENZIONE: nessun mercato spot {coin}/USDC nei metadata: coin ignorata", flush=True)
+            continue
+
+        markets[coin] = found
+
+    if not markets:
+        token_names = [t.get("name") for t in meta["tokens"]]
+        print(f"DEBUG TOKENS DISPONIBILI | {token_names}", flush=True)
+        raise RuntimeError("Nessun mercato spot trovato per le coin configurate")
+
+    return markets
 
 
-SPOT_COIN, BASE_COIN = resolve_spot_coin()
+MARKETS = resolve_spot_markets()
 
 
 # ============================================================
@@ -201,43 +223,36 @@ def refresh_week(state):
 # SPOT METADATA
 # ============================================================
 
-def get_spot_decimals():
-    meta = info.spot_meta()
-
-    for token in meta["tokens"]:
-        if token["name"] == BASE_COIN:
-            return int(token["szDecimals"])
-
-    raise RuntimeError(f"{BASE_COIN} non trovato nei metadata Spot")
+# Size: multipli di szDecimals della coin (default per difetto, per non
+# superare il saldo; per i BUY si passa ROUND_UP per non scendere sotto
+# il minimo d'ordine).
+def round_size(coin, size, rounding=ROUND_DOWN):
+    tick = Decimal(1).scaleb(-MARKETS[coin]["decimals"])
+    return float(Decimal(str(round(float(size), 8))).quantize(tick, rounding=rounding))
 
 
-def round_btc(size):
-    decimals = get_spot_decimals()
-    return round(float(size), decimals)
+# Prezzo: max 5 cifre significative (gli interi sono sempre validi) e
+# max (8 - szDecimals) decimali.
+def round_spot_price(coin, price, is_buy):
+    rounding = ROUND_DOWN if is_buy else ROUND_UP
+
+    d = Decimal(str(price))
+    d = d.quantize(Decimal(1).scaleb(min(d.adjusted() - 4, 0)), rounding=rounding)
+    d = d.quantize(Decimal(1).scaleb(-(8 - MARKETS[coin]["decimals"])), rounding=rounding)
+
+    return float(d)
 
 
-from hyperliquid.utils.signing import float_to_wire
-
-import math
-
-def round_spot_price(price, is_buy):
-    if is_buy:
-        # Per un BUY arrotonda per difetto all'intero più vicino
-        return float(math.floor(price))
-    else:
-        # Per un SELL arrotonda per eccesso all'intero più vicino
-        return float(math.ceil(price))
-
-def get_24h_high_price():
+def get_24h_high_price(coin):
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = end_ms - (24 * 60 * 60 * 1000)
-    
+
     # Recupera le candele da 1 ora (1h) per la coppia spot
-    candles = info.candles_snapshot(SPOT_COIN, "1h", start_ms, end_ms)
-    
+    candles = info.candles_snapshot(MARKETS[coin]["market"], "1h", start_ms, end_ms)
+
     if not candles:
-        raise RuntimeError("Impossibile recuperare i dati OHLCv delle ultime 24 ore")
-    
+        raise RuntimeError(f"Impossibile recuperare i dati OHLCv delle ultime 24 ore per {coin}")
+
     # Estrae il massimo (tasti 'h' nell'oggetto candela)
     high_24h = max(float(candle["h"]) for candle in candles)
     return high_24h
@@ -253,28 +268,27 @@ def get_spot_balances():
     usdc_total = 0.0
     usdc_hold = 0.0
 
-    btc_total = 0.0
-    btc_hold = 0.0
+    coins = {coin: {"total": 0.0, "available": 0.0} for coin in MARKETS}
 
     for balance in data.get("balances", []):
-        coin = balance.get("coin")
+        name = balance.get("coin")
 
         total = float(balance.get("total", 0) or 0)
         hold = float(balance.get("hold", 0) or 0)
 
-        if coin == "USDC":
+        if name == "USDC":
             usdc_total = total
             usdc_hold = hold
-        elif coin == BASE_COIN:
-            btc_total = total
-            btc_hold = hold
+        else:
+            for coin, market in MARKETS.items():
+                if name == market["base"]:
+                    coins[coin] = {"total": total, "available": max(0.0, total - hold)}
 
     return {
         "usdc_total": usdc_total,
         "usdc_available": max(0.0, usdc_total - usdc_hold),
 
-        "btc_total": btc_total,
-        "btc_available": max(0.0, btc_total - btc_hold)
+        "coins": coins
     }
 
 
@@ -282,14 +296,14 @@ def get_spot_balances():
 # PREZZO SPOT
 # ============================================================
 
-def get_spot_price():
-    book = info.l2_snapshot(SPOT_COIN)
+def get_spot_price(coin):
+    book = info.l2_snapshot(MARKETS[coin]["market"])
 
     levels = book.get("levels", [])
 
     if len(levels) < 2:
         raise RuntimeError(
-            "Orderbook BTC/USDC non disponibile"
+            f"Orderbook {coin}/USDC non disponibile"
         )
 
     bids = levels[0]
@@ -297,7 +311,7 @@ def get_spot_price():
 
     if not bids or not asks:
         raise RuntimeError(
-            "Bid/Ask BTC/USDC non disponibili"
+            f"Bid/Ask {coin}/USDC non disponibili"
         )
 
     best_bid = float(bids[0]["px"])
@@ -316,36 +330,36 @@ def get_spot_price():
 # ORDINE SPOT AGGRESSIVO IOC
 # ============================================================
 
-def get_spot_execution_price(is_buy, slippage):
-    book = info.l2_snapshot(SPOT_COIN)
+def get_spot_execution_price(coin, is_buy, slippage):
+    book = info.l2_snapshot(MARKETS[coin]["market"])
 
     levels = book.get("levels", [])
 
     if len(levels) < 2:
-        raise RuntimeError("Orderbook BTC/USDC non disponibile")
+        raise RuntimeError(f"Orderbook {coin}/USDC non disponibile")
 
     bids = levels[0]
     asks = levels[1]
 
     if is_buy:
         if not asks:
-            raise RuntimeError("Ask BTC/USDC non disponibile")
+            raise RuntimeError(f"Ask {coin}/USDC non disponibile")
 
         best_ask = float(asks[0]["px"])
 
         return best_ask * (1 + slippage)
     else:
         if not bids:
-            raise RuntimeError("Bid BTC/USDC non disponibile")
+            raise RuntimeError(f"Bid {coin}/USDC non disponibile")
 
         best_bid = float(bids[0]["px"])
 
         return best_bid * (1 - slippage)
 
 
-def spot_market_order(is_buy, size):
-    raw_price = get_spot_execution_price(is_buy, MAX_SLIPPAGE)
-    price = round_spot_price(raw_price, is_buy)
+def spot_market_order(coin, is_buy, size):
+    raw_price = get_spot_execution_price(coin, is_buy, MAX_SLIPPAGE)
+    price = round_spot_price(coin, raw_price, is_buy)
 
     if price <= 0:
         raise RuntimeError(f"Prezzo Spot non valido: {price}")
@@ -360,13 +374,14 @@ def spot_market_order(is_buy, size):
 
     log(
         f"ORDINE SPOT | "
+        f"{coin} | "
         f"{'BUY' if is_buy else 'SELL'} | "
-        f"{size:.8f} BTC | "
-        f"limite aggressivo ${price:.2f}"
+        f"{size:.8f} {coin} | "
+        f"limite aggressivo ${price}"
     )
 
     result = exchange.order(
-        SPOT_COIN,
+        MARKETS[coin]["market"],
         is_buy,
         size,
         price,
@@ -403,7 +418,7 @@ def spot_market_order(is_buy, size):
 # FILLS SPOT
 # ============================================================
 
-def get_spot_fills_since(start_ms):
+def get_spot_fills_since(coin, start_ms):
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
     fills = info.user_fills_by_time(ACCOUNT_ADDRESS, start_ms, end_ms)
@@ -411,9 +426,7 @@ def get_spot_fills_since(start_ms):
     result = []
 
     for fill in fills:
-        coin = fill.get("coin")
-
-        if coin == SPOT_COIN:
+        if fill.get("coin") == MARKETS[coin]["market"]:
             result.append(fill)
 
     return result
@@ -509,26 +522,27 @@ def estimate_fee(notional):
 def verify_spot_position(state):
     balances = get_spot_balances()
 
-    real_btc = balances["btc_total"]
+    for coin in MARKETS:
+        real_size = balances["coins"][coin]["total"]
 
-    local_btc = sum(float(lot["remaining_size"]) for lot in state["open_lots"])
+        local_size = sum(float(lot["remaining_size"]) for lot in state["open_lots"] if lot["coin"] == coin)
 
-    difference = abs(real_btc - local_btc)
+        difference = abs(real_size - local_size)
 
-    log(
-        f"CONTROLLO SPOT | "
-        f"BTC reale {real_btc:.8f} | "
-        f"lotti {local_btc:.8f} | "
-        f"diff {difference:.8f}"
-    )
-
-    if difference > POSITION_TOLERANCE:
-        raise RuntimeError(
-            "INCOERENZA BTC SPOT: "
-            f"saldo reale={real_btc:.8f}, "
-            f"lotti locali={local_btc:.8f}. "
-            "BOT BLOCCATO."
+        log(
+            f"CONTROLLO SPOT | "
+            f"{coin} reale {real_size:.8f} | "
+            f"lotti {local_size:.8f} | "
+            f"diff {difference:.8f}"
         )
+
+        if difference > POSITION_TOLERANCE:
+            raise RuntimeError(
+                f"INCOERENZA {coin} SPOT: "
+                f"saldo reale={real_size:.8f}, "
+                f"lotti locali={local_size:.8f}. "
+                "BOT BLOCCATO."
+            )
 
     return balances
 
@@ -537,19 +551,19 @@ def verify_spot_position(state):
 # BUY SPOT
 # ============================================================
 
-def place_buy(state):
+def place_buy(state, coin):
     balances = get_spot_balances()
 
-    current_btc = balances["btc_total"]
+    current_size = balances["coins"][coin]["total"]
 
-    current_price = get_spot_price()
+    current_price = get_spot_price(coin)
 
-    current_position_value = current_btc * current_price
+    current_position_value = current_size * current_price
 
     if current_position_value + BUY_USD > MAX_POSITION_USD:
         log(
             f"BUY BLOCCATO | "
-            f"BTC attuale ${current_position_value:.2f} | "
+            f"{coin} attuale ${current_position_value:.2f} | "
             f"BUY ${BUY_USD:.2f} | "
             f"MAX ${MAX_POSITION_USD:.2f}"
         )
@@ -570,19 +584,18 @@ def place_buy(state):
     # size indicativa
     if current_price <= 0:
         raise RuntimeError(
-            f"Prezzo BTC Spot non valido per il BUY: {current_price}"
+            f"Prezzo {coin} Spot non valido per il BUY: {current_price}"
         )
 
-    buy_size = BUY_USD / current_price
-    buy_size = round_btc(buy_size)
+    buy_size = round_size(coin, BUY_USD / current_price, ROUND_UP)
 
     if buy_size <= 0:
-        log("BUY BLOCCATO | size BTC non valida")
+        log(f"BUY BLOCCATO | size {coin} non valida")
         return False
 
     order_start_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-    result = spot_market_order(True, buy_size)
+    result = spot_market_order(coin, True, buy_size)
 
     if result.get("status") != "ok":
         raise RuntimeError(f"BUY SPOT rifiutato: {result}")
@@ -593,7 +606,7 @@ def place_buy(state):
         time.sleep(POST_ORDER_DELAY)
 
         for _ in range(FILL_CHECK_ATTEMPTS):
-            fills = get_spot_fills_since(order_start_ms - 2000)
+            fills = get_spot_fills_since(coin, order_start_ms - 2000)
             fill = calculate_fill(fills, True)
 
             if fill:
@@ -608,12 +621,29 @@ def place_buy(state):
     actual_price = fill["price"]
     actual_notional = fill["notional"]
 
+    # Se la fee del BUY e' prelevata in coin, il lotto tiene la quantita'
+    # realmente accreditata (variazione di saldo), altrimenti il controllo
+    # posizione diverge a ogni acquisto.
+    net_size = 0.0
+
+    for _ in range(FILL_CHECK_ATTEMPTS):
+        net_size = round(get_spot_balances()["coins"][coin]["total"] - current_size, 8)
+
+        if net_size > 0:
+            break
+
+        time.sleep(FILL_CHECK_DELAY)
+
+    if 0 < net_size < actual_size:
+        actual_size = net_size
+
     fee = estimate_fee(actual_notional)
 
     target_price = actual_price * (1 + TAKE_PROFIT_PERCENT / 100)
 
     lot = {
         "id": state["next_lot_id"],
+        "coin": coin,
         "buy_time": int(datetime.now(timezone.utc).timestamp() * 1000),
         "buy_price": actual_price,
         "buy_size": actual_size,
@@ -639,10 +669,11 @@ def place_buy(state):
     log(
         f"BUY SPOT CONFERMATO | "
         f"lotto #{lot['id']} | "
-        f"{actual_size:.8f} BTC | "
-        f"prezzo ${actual_price:.2f} | "
+        f"{coin} | "
+        f"{actual_size:.8f} {coin} | "
+        f"prezzo ${actual_price} | "
         f"investiti ${actual_notional:.4f} | "
-        f"TP ${target_price:.2f}"
+        f"TP ${target_price}"
     )
 
     return True
@@ -652,19 +683,25 @@ def place_buy(state):
 # LOTTI VENDIBILI
 # ============================================================
 
-def get_sellable_lots(state):
-    current_price = get_spot_price()
-
+def get_sellable_lots(state, prices):
     eligible = []
 
-    for lot in sorted(state["open_lots"], key=lambda x: x["id"]):
+    for lot in state["open_lots"]:
+        coin = lot["coin"]
+        current_price = prices[coin]
+
         if lot["remaining_size"] <= POSITION_TOLERANCE:
+            continue
+
+        # size vendibile (multiplo di szDecimals) sotto il minimo d'ordine
+        if round_size(coin, lot["remaining_size"]) * current_price < MIN_ORDER_USD:
             continue
 
         if current_price >= lot["target_price"]:
             eligible.append(lot)
 
-    return eligible
+    # Rendimento maggiore per primo
+    return sorted(eligible, key=lambda x: prices[x["coin"]] / x["buy_price"], reverse=True)
 
 
 # ============================================================
@@ -672,32 +709,34 @@ def get_sellable_lots(state):
 # ============================================================
 
 def sell_lot(state, lot):
-    sell_size = round_btc(lot["remaining_size"])
+    coin = lot["coin"]
+
+    sell_size = round_size(coin, lot["remaining_size"])
 
     if sell_size <= 0:
         return False
 
-    current_price = get_spot_price()
+    current_price = get_spot_price(coin)
 
     if current_price < lot["target_price"]:
         return False
 
     balances = get_spot_balances()
 
-    if balances["btc_available"] + POSITION_TOLERANCE < sell_size:
-        raise RuntimeError("BTC Spot disponibile inferiore al lotto da vendere.")
+    if balances["coins"][coin]["available"] + POSITION_TOLERANCE < sell_size:
+        raise RuntimeError(f"{coin} Spot disponibile inferiore al lotto da vendere.")
 
     log(
         f"SELL SPOT | "
         f"lotto #{lot['id']} | "
-        f"{sell_size:.8f} BTC | "
-        f"prezzo ${current_price:.2f} | "
-        f"target ${lot['target_price']:.2f}"
+        f"{sell_size:.8f} {coin} | "
+        f"prezzo ${current_price} | "
+        f"target ${lot['target_price']}"
     )
 
     order_start_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-    result = spot_market_order(False, sell_size)
+    result = spot_market_order(coin, False, sell_size)
 
     if result.get("status") != "ok":
         raise RuntimeError(f"SELL SPOT rifiutato: {result}")
@@ -708,7 +747,7 @@ def sell_lot(state, lot):
         time.sleep(POST_ORDER_DELAY)
 
         for _ in range(FILL_CHECK_ATTEMPTS):
-            fills = get_spot_fills_since(order_start_ms - 2000)
+            fills = get_spot_fills_since(coin, order_start_ms - 2000)
             fill = calculate_fill(fills, False)
 
             if fill:
@@ -738,6 +777,7 @@ def sell_lot(state, lot):
 
     trade = {
         "lot_id": lot["id"],
+        "coin": coin,
         "sell_time": int(datetime.now(timezone.utc).timestamp() * 1000),
         "sell_size": sold_size,
         "sell_price": sell_price,
@@ -764,8 +804,9 @@ def sell_lot(state, lot):
     log(
         f"SELL SPOT CONFERMATO | "
         f"lotto #{lot['id']} | "
-        f"{sold_size:.8f} BTC | "
-        f"prezzo ${sell_price:.2f} | "
+        f"{coin} | "
+        f"{sold_size:.8f} {coin} | "
+        f"prezzo ${sell_price} | "
         f"PnL netto ${net_pnl:.4f}"
     )
 
@@ -776,13 +817,13 @@ def sell_lot(state, lot):
 # SELL CHECK
 # ============================================================
 
-def check_sell(state):
-    eligible = get_sellable_lots(state)
+def check_sell(state, prices):
+    eligible = get_sellable_lots(state, prices)
 
     if not eligible:
         return False
 
-    # FIFO
+    # Lotto con il rendimento maggiore (tra tutte le coin)
     lot = eligible[0]
 
     return sell_lot(state, lot)
@@ -792,19 +833,33 @@ def check_sell(state):
 # BUY CHECK
 # ============================================================
 
-def check_buy(state, current_price):
-    high_24h = get_24h_high_price()
-    
-    # Calcola la percentuale di ribasso rispetto al massimo a 24 ore
-    drop_percent = ((high_24h - current_price) / high_24h) * 100
-    
-    log(f"ANALISI 24H | Prezzo Corrente: ${current_price:.2f} | Max 24h: ${high_24h:.2f} | Ribasso: {drop_percent:.2f}%")
-    
+def check_buy(state, prices):
+    drops = []
+
+    for coin in MARKETS:
+        high_24h = get_24h_high_price(coin)
+
+        # Calcola la percentuale di ribasso rispetto al massimo a 24 ore
+        drop_percent = ((high_24h - prices[coin]) / high_24h) * 100
+
+        log(f"ANALISI 24H | {coin} | Prezzo Corrente: ${prices[coin]} | Max 24h: ${high_24h} | Ribasso: {drop_percent:.2f}%")
+
+        drops.append((drop_percent, coin))
+
+    # Ribasso piu' forte per primo
+    drops.sort(reverse=True)
+
     # Dip_PERCENT impostato nel file .env (es. DIP_PERCENT=2)
-    if drop_percent >= DIP_PERCENT:
-        log(f"DIP 24H RILEVATO | Il prezzo è sceso del {drop_percent:.2f}% (>= {DIP_PERCENT:.2f}%) dal massimo 24h.")
-        return place_buy(state)
-        
+    for drop_percent, coin in drops:
+        if drop_percent < DIP_PERCENT:
+            break
+
+        log(f"DIP 24H RILEVATO | {coin} | Il prezzo è sceso del {drop_percent:.2f}% (>= {DIP_PERCENT:.2f}%) dal massimo 24h.")
+
+        # Se il BUY della coin col ribasso maggiore e' bloccato (limiti), prova la successiva
+        if place_buy(state, coin):
+            return True
+
     return False
 
 
@@ -816,27 +871,31 @@ def check_buy(state, current_price):
 def calculate_performance(state):
     balances = get_spot_balances()
 
-    current_price = get_spot_price()
+    prices = {coin: get_spot_price(coin) for coin in MARKETS}
 
-    open_cost = 0.0
-    open_size = 0.0
+    open_size = {coin: 0.0 for coin in MARKETS}
+    open_cost_by_coin = {coin: 0.0 for coin in MARKETS}
     open_buy_fees = 0.0
 
     for lot in state["open_lots"]:
+        coin = lot["coin"]
+
         size = float(lot["remaining_size"])
 
-        open_size += size
+        open_size[coin] += size
 
-        open_cost += size * float(lot["buy_price"])
+        open_cost_by_coin[coin] += size * float(lot["buy_price"])
 
         if lot["buy_size"] > 0:
             open_buy_fees += float(lot["buy_fee"]) * (size / float(lot["buy_size"]))
 
-    # Il valore BTC usato nel PnL si basa solo sui lotti tracciati
-    # (open_size), non sul saldo reale totale: eventuale BTC non
-    # tracciato (dust residuo, arrotondamenti) non deve comparire
+    open_cost = sum(open_cost_by_coin.values())
+
+    # Il valore delle coin usato nel PnL si basa solo sui lotti tracciati
+    # (open_size), non sul saldo reale totale: eventuale coin non
+    # tracciata (dust residuo, arrotondamenti) non deve comparire
     # come profitto gratuito nel rendimento.
-    btc_value = open_size * current_price
+    coins_value = sum(open_size[coin] * prices[coin] for coin in MARKETS)
 
     closed_buy_cost = sum(float(trade["buy_cost_allocated"]) for trade in state["sell_trades"])
 
@@ -846,9 +905,9 @@ def calculate_performance(state):
 
     realized_net = sum(float(trade["net_pnl"]) for trade in state["sell_trades"])
 
-    unrealized_gross = btc_value - open_cost
+    unrealized_gross = coins_value - open_cost
 
-    estimated_exit_fee = estimate_fee(btc_value)
+    estimated_exit_fee = estimate_fee(coins_value)
 
     total_net_pnl = realized_net + unrealized_gross - open_buy_fees - estimated_exit_fee
 
@@ -859,10 +918,12 @@ def calculate_performance(state):
 
     return {
         "usdc_available": balances["usdc_available"],
-        "btc_size": balances["btc_total"],
-        "btc_value": btc_value,
+        "coins_value": coins_value,
         "open_cost": open_cost,
-        "weighted_avg_price": (open_cost / open_size if open_size > 0 else 0.0),
+        "weighted_avg_price": {
+            coin: (open_cost_by_coin[coin] / open_size[coin] if open_size[coin] > 0 else 0.0)
+            for coin in MARKETS
+        },
         "sold_notional": sold_notional,
         "realized_net": realized_net,
         "unrealized_gross": unrealized_gross,
@@ -878,15 +939,16 @@ def calculate_performance(state):
 def log_capital():
     balances = get_spot_balances()
 
-    price = get_spot_price()
-
-    btc_value = balances["btc_total"] * price
+    holdings = " | ".join(
+        f"{coin} {balances['coins'][coin]['total']:.8f} "
+        f"(~${balances['coins'][coin]['total'] * get_spot_price(coin):.4f})"
+        for coin in MARKETS
+    )
 
     log(
         f"CAPITALE SPOT | "
         f"USDC disponibile ${balances['usdc_available']:.4f} | "
-        f"BTC {balances['btc_total']:.8f} "
-        f"(~${btc_value:.4f})"
+        f"{holdings}"
     )
 
 
@@ -903,34 +965,35 @@ def run():
 
     log("=" * 50)
 
-    log("AVVIO BOT HYPERLIQUID BTC SPOT")
+    log("AVVIO BOT HYPERLIQUID SPOT MULTI-COIN")
 
     log(
         f"PARAMETRI | "
+        f"COIN {','.join(MARKETS)} | "
         f"BUY ${BUY_USD:.2f} | "
         f"DIP {DIP_PERCENT:.2f}% | "
         f"TP {TAKE_PROFIT_PERCENT:.2f}% | "
-        f"MAX BTC ${MAX_POSITION_USD:.2f} | "
+        f"MAX PER COIN ${MAX_POSITION_USD:.2f} | "
         f"MAX BUY SETT {MAX_WEEKLY_BUYS}"
     )
 
     log_capital()
 
     # --------------------------------------------------------
-    # CONTROLLO SALDO BTC
+    # CONTROLLO SALDO COIN
     # --------------------------------------------------------
 
     verify_spot_position(state)
 
-    current_price = get_spot_price()
+    prices = {coin: get_spot_price(coin) for coin in MARKETS}
 
-    log(f"PREZZO ATTUALE | ${current_price:.2f}")
+    log("PREZZI ATTUALI | " + " | ".join(f"{coin} ${price}" for coin, price in prices.items()))
 
     # --------------------------------------------------------
     # SELL PRIMA DEL BUY
     # --------------------------------------------------------
 
-    sold = check_sell(state)
+    sold = check_sell(state, prices)
 
     if sold:
         log("SELL SPOT eseguito: nessun BUY in questo ciclo.")
@@ -945,7 +1008,7 @@ def run():
     # BUY
     # --------------------------------------------------------
 
-    bought = check_buy(state, current_price)
+    bought = check_buy(state, prices)
 
     if bought:
         log("BUY SPOT eseguito.")
@@ -958,14 +1021,15 @@ def run():
 
     performance = calculate_performance(state)
 
+    avg_prices = ", ".join(f"{coin} ${price:.2f}" for coin, price in performance["weighted_avg_price"].items())
+
     log(
         f"PERFORMANCE SPOT | "
         f"USDC disponibile ${performance['usdc_available']:.4f} | "
-        f"BTC {performance['btc_size']:.8f} | "
-        f"valore BTC ${performance['btc_value']:.4f} | "
+        f"valore coin ${performance['coins_value']:.4f} | "
         f"investito ${performance['open_cost']:.4f} | "
         f"venduto ${performance['sold_notional']:.4f} | "
-        f"media acquisto ${performance['weighted_avg_price']:.2f} | "
+        f"media acquisto {avg_prices} | "
         f"realizzato ${performance['realized_net']:.4f} | "
         f"unrealizzato ${performance['unrealized_gross']:.4f} | "
         f"PnL totale ${performance['total_net_pnl']:.4f} | "
