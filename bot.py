@@ -868,16 +868,33 @@ def check_sell(state, prices):
 # BUY CHECK
 # ============================================================
 
+def get_buy_reference(state, coin, prices):
+    # Primo lotto della coin: riferimento massimo 24h.
+    # Dal secondo lotto in poi: riferimento il lotto col prezzo di acquisto piu' basso
+    # (esclusi i lotti residui, che non sono acquisti diretti).
+    open_lots = [
+        lot for lot in state["open_lots"]
+        if lot["coin"] == coin and not lot.get("residual")
+    ]
+
+    if not open_lots:
+        return get_24h_high_price(coin), "24H"
+
+    lowest = min(lot["buy_price"] for lot in open_lots)
+
+    return lowest, "LOTTO"
+
+
 def check_buy(state, prices):
     drops = []
 
     for coin in MARKETS:
-        high_24h = get_24h_high_price(coin)
+        reference, ref_type = get_buy_reference(state, coin, prices)
 
-        # Calcola la percentuale di ribasso rispetto al massimo a 24 ore
-        drop_percent = ((high_24h - prices[coin]) / high_24h) * 100
+        # Calcola la percentuale di ribasso rispetto al riferimento (max 24h o lotto piu' basso)
+        drop_percent = ((reference - prices[coin]) / reference) * 100
 
-        log(f"ANALISI 24H | {coin} | Prezzo Corrente: ${prices[coin]} | Max 24h: ${high_24h} | Ribasso: {drop_percent:.2f}%")
+        log(f"ANALISI {ref_type} | {coin} | Prezzo Corrente: ${prices[coin]} | Riferimento: ${reference} | Ribasso: {drop_percent:.2f}%")
 
         drops.append((drop_percent, coin))
 
@@ -889,7 +906,7 @@ def check_buy(state, prices):
         if drop_percent < DIP_PERCENT:
             break
 
-        log(f"DIP 24H RILEVATO | {coin} | Il prezzo è sceso del {drop_percent:.2f}% (>= {DIP_PERCENT:.2f}%) dal massimo 24h.")
+        log(f"DIP RILEVATO | {coin} | Il prezzo è sceso del {drop_percent:.2f}% (>= {DIP_PERCENT:.2f}%) dal riferimento.")
 
         # Se il BUY della coin col ribasso maggiore e' bloccato (limiti), prova la successiva
         if place_buy(state, coin):
