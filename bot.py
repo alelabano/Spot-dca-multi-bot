@@ -5,6 +5,7 @@ import traceback
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from datetime import datetime, timezone
 
+import requests
 from dotenv import load_dotenv
 from eth_account import Account
 
@@ -51,6 +52,9 @@ FILL_CHECK_ATTEMPTS = int(os.getenv("FILL_CHECK_ATTEMPTS", "5"))
 FILL_CHECK_DELAY = float(os.getenv("FILL_CHECK_DELAY", "1"))
 
 POSITION_TOLERANCE = float(os.getenv("POSITION_TOLERANCE", "0.00003"))
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # Valore minimo di un ordine spot su Hyperliquid
 MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "10"))
@@ -148,6 +152,20 @@ MARKETS = resolve_spot_markets()
 def log(message):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"[{now}] {message}", flush=True)
+
+
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=10
+        )
+    except Exception as e:
+        log(f"TELEGRAM ERRORE | {e}")
 
 
 # ============================================================
@@ -580,6 +598,11 @@ def place_buy(state, coin):
         log(
             f"BUY BLOCCATO | "
             f"USDC disponibili ${balances['usdc_available']:.4f} | "
+            f"necessari ${BUY_USD:.2f}"
+        )
+        send_telegram(
+            f"DIP {coin} rilevato ma BUY non eseguito: "
+            f"USDC disponibili ${balances['usdc_available']:.4f}, "
             f"necessari ${BUY_USD:.2f}"
         )
         return False
