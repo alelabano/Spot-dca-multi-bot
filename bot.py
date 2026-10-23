@@ -601,7 +601,7 @@ def place_buy(state, coin):
             f"necessari ${BUY_USD:.2f}"
         )
         send_telegram(
-            f"DIP {coin} rilevato ma BUY non eseguito: "
+            f"DIP {coin} rilevato a ${current_price} ma BUY non eseguito: "
             f"USDC disponibili ${balances['usdc_available']:.4f}, "
             f"necessari ${BUY_USD:.2f}"
         )
